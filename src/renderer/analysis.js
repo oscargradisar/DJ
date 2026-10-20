@@ -264,6 +264,201 @@ export function detectTempo(mono, sampleRate, { minBpm = 70, maxBpm = 180 } = {}
   return { bpm, offset, confidence };
 }
 
+// ------------------------------------------------------------------ key
+
+export const PITCH_NAMES = ['C', 'C#', 'D', 'Eb', 'E', 'F', 'F#', 'G', 'Ab', 'A', 'Bb', 'B'];
+
+// Krumhansl–Kessler key profiles (major, minor), tonic first. They describe
+// which notes a key uses; audio also carries each note's overtones (the 3rd
+// harmonic is a fifth up, the 5th a major third up), which drags a raw chroma
+// toward the dominant. So, as in Gómez's audio key-finding, the profiles get
+// the same overtones folded in before they're compared with the audio.
+const KK_MAJOR = [6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88];
+const KK_MINOR = [6.33, 2.68, 3.52, 5.38, 2.6, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17];
+const HARMONIC_INTERVALS = [0, 0, 7, 0, 4, 7]; // harmonics 1–6, in semitones above the note (mod 12)
+function withOvertones(profile, decay = 0.6) {
+  const out = new Array(12).fill(0);
+  for (let pc = 0; pc < 12; pc++) {
+    HARMONIC_INTERVALS.forEach((iv, h) => {
+      out[(pc + iv) % 12] += profile[pc] * decay ** h;
+    });
+  }
+  return out;
+}
+const MAJOR_PROFILE = withOvertones(KK_MAJOR);
+const MINOR_PROFILE = withOvertones(KK_MINOR);
+
+/**
+ * Keys are numbers 0–23: tonic pitch class (C = 0) + 12 for minor.
+ * keyName(9 + 12) → 'Am', camelot(9 + 12) → '8A'.
+ */
+export function keyName(key) {
+  if (key == null || key < 0) return '';
+  return PITCH_NAMES[key % 12] + (key >= 12 ? 'm' : '');
+}
+
+export function camelot(key) {
+  if (key == null || key < 0) return '';
+  const minor = key >= 12;
+  const tonic = key % 12;
+  const relMajor = minor ? (tonic + 3) % 12 : tonic; // A minor ↔ C major
+  return `${(((relMajor * 7) % 12) + 7) % 12 + 1}${minor ? 'A' : 'B'}`;
+}
+
+/** Key moved by a number of semitones (rounded). */
+export function transposeKey(key, semitones) {
+  if (key == null || key < 0) return key;
+  const tonic = (((key % 12) + Math.round(semitones)) % 12 + 12) % 12;
+  return tonic + (key >= 12 ? 12 : 0);
+}
+
+function fftInPlace(re, im) {
+  const n = re.length;
+  for (let i = 1, j = 0; i < n; i++) {
+    let bit = n >> 1;
+    for (; j & bit; bit >>= 1) j ^= bit;
+    j ^= bit;
+    if (i < j) {
+      let t = re[i]; re[i] = re[j]; re[j] = t;
+      t = im[i]; im[i] = im[j]; im[j] = t;
+    }
+  }
+  for (let size = 2; size <= n; size <<= 1) {
+    const ang = (-2 * Math.PI) / size;
+    const wr = Math.cos(ang);
+    const wi = Math.sin(ang);
+    for (let start = 0; start < n; start += size) {
+      let cr = 1;
+      let ci = 0;
+      for (let k = 0; k < size / 2; k++) {
+        const a = start + k;
+        const b = a + size / 2;
+        const xr = re[b] * cr - im[b] * ci;
+        const xi = re[b] * ci + im[b] * cr;
+        re[b] = re[a] - xr;
+        im[b] = im[a] - xi;
+        re[a] += xr;
+        im[a] += xi;
+        const t = cr * wr - ci * wi;
+        ci = cr * wi + ci * wr;
+        cr = t;
+      }
+    }
+  }
+}
+
+/** 12-bin chroma (pitch-class energy) summed over the track. */
+export function chromagram(mono, sampleRate, { maxFrames = 600 } = {}) {
+  // Work at ~11 kHz: plenty for 55 Hz–2 kHz, and 4× less to transform.
+  const dec = Math.max(1, Math.round(sampleRate / 11025));
+  const sr = sampleRate / dec;
+  const len = Math.floor(mono.length / dec);
+  const x = new Float32Array(len);
+  for (let i = 0; i < len; i++) {
+    let s = 0;
+    for (let j = 0; j < dec; j++) s += mono[i * dec + j];
+    x[i] = s / dec;
+  }
+
+  const N = 8192; // ~1.3 Hz bins at 11 kHz: resolves semitones down to ~55 Hz
+  const win = new Float32Array(N);
+  for (let i = 0; i < N; i++) win[i] = 0.5 - 0.5 * Math.cos((2 * Math.PI * i) / N);
+  const frames = Math.max(0, Math.floor((len - N) / (N / 4)) + 1);
+  const step = Math.max(1, Math.ceil(frames / maxFrames));
+
+  // Each FFT bin → (pitch class, weight). Weight falls off away from the semitone centre.
+  const lo = Math.ceil((55 * N) / sr);
+  const hi = Math.min(N / 2 - 1, Math.floor((2000 * N) / sr));
+  const binPc = new Int8Array(hi + 1).fill(-1);
+  const binW = new Float32Array(hi + 1);
+  for (let k = lo; k <= hi; k++) {
+    const midi = 69 + 12 * Math.log2((k * sr) / N / 440);
+    const nearest = Math.round(midi);
+    const d = Math.abs(midi - nearest);
+    if (d < 0.4) {
+      binPc[k] = ((nearest % 12) + 12) % 12;
+      binW[k] = Math.cos((d / 0.4) * (Math.PI / 2));
+    }
+  }
+
+  const chroma = new Float64Array(12);
+  const re = new Float64Array(N);
+  const im = new Float64Array(N);
+  const frameChroma = new Float64Array(12);
+  for (let f = 0; f < frames; f += step) {
+    const off = f * (N / 4);
+    let energy = 0;
+    for (let i = 0; i < N; i++) {
+      re[i] = x[off + i] * win[i];
+      im[i] = 0;
+      energy += re[i] * re[i];
+    }
+    if (energy < 1e-6) continue; // silence
+    fftInPlace(re, im);
+    frameChroma.fill(0);
+    for (let k = lo; k <= hi; k++) {
+      if (binPc[k] < 0) continue;
+      const m = Math.sqrt(re[k] * re[k] + im[k] * im[k]);
+      // Only spectral peaks count — keeps noise and drums from flattening the chroma.
+      const pm = Math.sqrt(re[k - 1] * re[k - 1] + im[k - 1] * im[k - 1]);
+      const nm = Math.sqrt(re[k + 1] * re[k + 1] + im[k + 1] * im[k + 1]);
+      if (m > pm && m >= nm) frameChroma[binPc[k]] += Math.log1p(m) * binW[k];
+    }
+    let total = 0;
+    for (let c = 0; c < 12; c++) total += frameChroma[c];
+    if (total > 0) for (let c = 0; c < 12; c++) chroma[c] += frameChroma[c] / total;
+  }
+  return chroma;
+}
+
+function correlate(a, b) {
+  let ma = 0;
+  let mb = 0;
+  for (let i = 0; i < 12; i++) {
+    ma += a[i];
+    mb += b[i];
+  }
+  ma /= 12;
+  mb /= 12;
+  let num = 0;
+  let da = 0;
+  let db = 0;
+  for (let i = 0; i < 12; i++) {
+    const x = a[i] - ma;
+    const y = b[i] - mb;
+    num += x * y;
+    da += x * x;
+    db += y * y;
+  }
+  return da && db ? num / Math.sqrt(da * db) : 0;
+}
+
+/**
+ * Detect the musical key. Returns { key, confidence, scores } with key 0–23
+ * (see keyName / camelot), or null when there's no clear tonal content.
+ */
+export function detectKey(mono, sampleRate) {
+  if (mono.length / sampleRate < 5) return null;
+  const chroma = chromagram(mono, sampleRate);
+  if (chroma.every((v) => v === 0)) return null;
+  const scores = [];
+  for (let tonic = 0; tonic < 12; tonic++) {
+    for (const [mode, profile] of [[0, MAJOR_PROFILE], [12, MINOR_PROFILE]]) {
+      const rotated = new Array(12);
+      for (let i = 0; i < 12; i++) rotated[(i + tonic) % 12] = profile[i];
+      scores.push({ key: tonic + mode, r: correlate(chroma, rotated) });
+    }
+  }
+  scores.sort((a, b) => b.r - a.r);
+  const best = scores[0];
+  if (best.r < 0.3) return null;
+  // Confidence: margin over the runner-up that isn't the relative major/minor
+  // (those share a scale and are near-ties by nature, and mix fine anyway).
+  const runnerUp = scores.find((s) => s.key !== best.key && camelot(s.key).slice(0, -1) !== camelot(best.key).slice(0, -1));
+  const confidence = Math.max(0, Math.min(1, (best.r - (runnerUp?.r ?? 0)) * 4));
+  return { key: best.key, confidence, scores: scores.slice(0, 4) };
+}
+
 /** Beat phase (0..1) at a given track position. */
 export function beatPhase(position, bpm, offset) {
   const period = 60 / bpm;

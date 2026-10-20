@@ -26,6 +26,8 @@ if '--flat-playlist' in args:
     ]}))
     sys.exit(0)
 
+# NoGate build: every ID below downloads. The comments describe what the
+# license gate should do once it's reimplemented (see license-gate-features/).
 licenses = {
     'cc1': None,  # license row missing — only trusted because the CC search returned it
     'cc2': 'Creative Commons Attribution license (reuse allowed)',

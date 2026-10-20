@@ -12,16 +12,17 @@ const crypto = require('node:crypto');
 
 const AUDIO_EXTENSIONS = ['mp3', 'm4a', 'aac', 'wav', 'flac', 'ogg', 'opus', 'webm', 'aif', 'aiff'];
 
-// YouTube's own "Creative Commons" search filter.
+// YouTube's own "Creative Commons" search filter. Not used in the NoGate
+// build's search (see search-issues/3-cc-filter.md).
 const CC_SEARCH_PARAM = 'EgIwAQ%253D%253D';
-// What counts as a reuse-friendly license in yt-dlp's `license` field.
-const CC_LICENSE_RE = /creative\s*commons|\bcc[\s-]?(by|0)\b|public\s+domain/i;
+
+// NO-GATE BUILD: the license gate (license-field check, CC-search memory and
+// title-search fallback) is removed here. See license-gate-features/ for the
+// original code and the plan for putting each piece back.
 
 const paths = {};
 let mainWindow = null;
 let library = { version: 1, tracks: [] };
-// Video IDs that YouTube itself returned under the Creative Commons filter.
-const ccVerifiedIds = new Set();
 const activeDownloads = new Map();
 
 // ---------------------------------------------------------------- paths
@@ -185,10 +186,6 @@ function cleanError(stderr) {
   return msg.replace(/;?\s*please report this issue.*$/i, '').slice(0, 300);
 }
 
-function isCcLicense(license) {
-  return typeof license === 'string' && CC_LICENSE_RE.test(license);
-}
-
 function pickThumb(entry) {
   if (entry.thumbnail) return entry.thumbnail;
   const thumbs = Array.isArray(entry.thumbnails) ? entry.thumbnails : [];
@@ -196,25 +193,48 @@ function pickThumb(entry) {
   return mid?.url || null;
 }
 
+// How many results the search asks yt-dlp for (YouTube's first page is ~20,
+// then more as you scroll). See search-issues/2-result-cap.md.
+const SEARCH_LIMIT = 50;
+
+// NOGATE BUILD: plain YouTube search, same query and order as typing it into
+// youtube.com. The Creative Commons filter (CC_SEARCH_PARAM) is off; see
+// search-issues/3-cc-filter.md. Returns the results plus details of exactly
+// what was searched and what was dropped, so the search tab can show it.
 async function searchCreativeCommons(query) {
   const q = String(query || '').trim();
-  if (!q) return [];
-  const url = `https://www.youtube.com/results?search_query=${encodeURIComponent(q)}&sp=${CC_SEARCH_PARAM}`;
-  const out = await runYtdlp(['--flat-playlist', '--playlist-end', '25', '-J', url]);
+  const url = `https://www.youtube.com/results?search_query=${encodeURIComponent(q)}`;
+  const info = { query: q, url, filter: 'none (plain YouTube search)', limit: SEARCH_LIMIT };
+  if (!q) return { ...info, received: 0, dropped: [], results: [], ms: 0 };
+  const started = Date.now();
+  const out = await runYtdlp(['--flat-playlist', '--playlist-end', String(SEARCH_LIMIT), '-J', url]);
   const data = JSON.parse(out);
-  const entries = (data.entries || []).filter((e) => e && e.id && (e.ie_key === 'Youtube' || !e.ie_key));
-  return entries.map((e) => {
-    ccVerifiedIds.add(e.id);
-    return {
-      id: e.id,
-      title: e.title || e.id,
-      channel: e.channel || e.uploader || '',
-      duration: e.duration || null,
-      url: e.url && e.url.startsWith('http') ? e.url : `https://www.youtube.com/watch?v=${e.id}`,
-      thumbnail: pickThumb(e),
-      inLibrary: library.tracks.some((t) => t.source?.id === e.id),
-    };
-  });
+  const raw = data.entries || [];
+  const dropped = [];
+  const seen = new Set();
+  const kept = [];
+  for (const e of raw) {
+    let reason = null;
+    if (!e || !e.id) reason = 'no video id';
+    else if (e.ie_key && e.ie_key !== 'Youtube') reason = `not a video (${e.ie_key})`;
+    else if (seen.has(e.id)) reason = 'duplicate';
+    if (reason) dropped.push({ id: e?.id || '', title: e?.title || '', reason });
+    else {
+      seen.add(e.id);
+      kept.push(e);
+    }
+  }
+  const results = kept.map((e, i) => ({
+    rank: i + 1,
+    id: e.id,
+    title: e.title || e.id,
+    channel: e.channel || e.uploader || '',
+    duration: e.duration || null,
+    url: e.url && e.url.startsWith('http') ? e.url : `https://www.youtube.com/watch?v=${e.id}`,
+    thumbnail: pickThumb(e),
+    inLibrary: library.tracks.some((t) => t.source?.id === e.id),
+  }));
+  return { ...info, received: raw.length, dropped, results, ms: Date.now() - started };
 }
 
 function validateUrl(raw) {
@@ -233,61 +253,6 @@ async function fetchInfo(url) {
   return JSON.parse(out);
 }
 
-// Ask YouTube itself: does this video show up when searching its own title
-// with the Creative Commons filter on? That's YouTube's CC flag, and it works
-// even when yt-dlp doesn't return a license field for the video.
-async function confirmViaCcSearch(info) {
-  const queries = [info.title, info.channel && `${info.title} ${info.channel}`].filter(Boolean);
-  for (const q of queries) {
-    const url = `https://www.youtube.com/results?search_query=${encodeURIComponent(q)}&sp=${CC_SEARCH_PARAM}`;
-    try {
-      const out = await runYtdlp(['--flat-playlist', '--playlist-end', '40', '-J', url]);
-      const ids = (JSON.parse(out).entries || []).map((e) => e && e.id);
-      if (ids.includes(info.id)) {
-        ccVerifiedIds.add(info.id);
-        return true;
-      }
-    } catch {
-      // fall through to the next query
-    }
-  }
-  return false;
-}
-
-const isYoutube = (info) => /youtube/i.test(info.extractor_key || info.extractor || '');
-
-async function licenseVerdict(info, onStatus = () => {}) {
-  if (isCcLicense(info.license)) {
-    return { ok: true, license: info.license, how: 'license' };
-  }
-  if (info.id && ccVerifiedIds.has(info.id) && isYoutube(info)) {
-    return { ok: true, license: info.license || 'Creative Commons Attribution (YouTube CC filter)', how: 'cc-search' };
-  }
-  // No usable license field (common on YouTube now): check against YouTube's CC filter.
-  const explicitlyStandard = /standard youtube license/i.test(info.license || '');
-  if (isYoutube(info) && !explicitlyStandard) {
-    onStatus('Checking YouTube’s Creative Commons filter…');
-    if (await confirmViaCcSearch(info)) {
-      return { ok: true, license: 'Creative Commons Attribution (YouTube CC filter)', how: 'cc-search-check' };
-    }
-  }
-  return { ok: false, license: info.license || null };
-}
-
-function skipMessage(info) {
-  if (/standard youtube license/i.test(info.license || '')) {
-    return (
-      'Skipped: YouTube lists this upload under the Standard YouTube License, not Creative Commons. ' +
-      'The song itself might still be CC (lots of re-uploads are labelled this way) — if so, download it from ' +
-      'the artist’s own site and drag the file in.'
-    );
-  }
-  return (
-    'Skipped: YouTube doesn’t list this upload as Creative Commons. If the music is CC from its original source, ' +
-    'download it from there and drag the file in.'
-  );
-}
-
 async function downloadTrack({ url, jobId }) {
   const send = (payload) => mainWindow?.webContents.send('download:progress', { jobId, ...payload });
   const controller = new AbortController();
@@ -295,7 +260,7 @@ async function downloadTrack({ url, jobId }) {
 
   try {
     const cleanUrl = validateUrl(url);
-    send({ stage: 'checking', message: 'Checking license…' });
+    send({ stage: 'checking', message: 'Fetching video info…' });
     await ensureYtdlp((message) => send({ stage: 'setup', message }));
     const info = await fetchInfo(cleanUrl);
 
@@ -304,9 +269,6 @@ async function downloadTrack({ url, jobId }) {
       send({ stage: 'done', message: 'Already in your library', track: publicTrack(existing) });
       return publicTrack(existing);
     }
-
-    const verdict = await licenseVerdict(info, (message) => send({ stage: 'checking', message }));
-    if (!verdict.ok) throw new Error(skipMessage(info));
 
     send({ stage: 'downloading', message: 'Downloading audio…', percent: 0 });
     const outTemplate = path.join(paths.audio, '%(extractor_key)s-%(id)s.%(ext)s');
@@ -361,8 +323,9 @@ async function downloadTrack({ url, jobId }) {
         url: info.webpage_url || cleanUrl,
         uploader: info.channel || info.uploader || '',
         uploaderUrl: info.channel_url || info.uploader_url || '',
-        license: verdict.license,
-        licenseCheckedBy: verdict.how,
+        // Recorded as reported, not checked (no-gate build).
+        license: info.license || null,
+        licenseCheckedBy: 'unchecked',
       },
     };
     library.tracks.unshift(track);
@@ -406,15 +369,107 @@ async function importLocalFiles(filePaths) {
   return added;
 }
 
+// ---------------------------------------------------------------- AI stems (prototype)
+//
+// Optional: needs onnxruntime-node next to the app and the HT-Demucs ONNX model
+// in <userData>/models (or <app>/models). Without them the decks keep using the
+// real-time DSP stems. Each track is separated once; the four stems are cached
+// as WAVs in <userData>/stems/<trackId>/.
+
+const STEM_MODEL = 'htdemucs_fp16weights.onnx';
+const STEM_NAMES = ['drums', 'bass', 'other', 'vocals'];
+let stemWorker = null;
+const stemJobs = new Map(); // trackId -> { promise, resolve, reject }
+let stemQueue = Promise.resolve();
+
+function stemSetup() {
+  const model = [path.join(paths.root, 'models', STEM_MODEL), path.join(__dirname, '..', 'models', STEM_MODEL)].find((p) => fs.existsSync(p));
+  // Packaged: resources/ort/onnxruntime-node (native code can't run from inside the app archive).
+  // Dev: a normal node_modules install.
+  let runtime = null;
+  const packaged = path.join(process.resourcesPath || '', 'ort', 'onnxruntime-node');
+  if (fs.existsSync(path.join(packaged, 'package.json'))) runtime = packaged;
+  else {
+    try {
+      runtime = path.dirname(require.resolve('onnxruntime-node/package.json'));
+    } catch {}
+  }
+  return { model, runtime, available: !!(model && runtime) };
+}
+
+const stemDir = (id) => path.join(paths.root, 'stems', String(id).replace(/[^a-zA-Z0-9_-]/g, ''));
+
+function cachedStems(id) {
+  const dir = stemDir(id);
+  if (!fs.existsSync(path.join(dir, 'stems.json'))) return null;
+  const files = Object.fromEntries(STEM_NAMES.map((n) => [n, path.join(dir, `${n}.wav`)]));
+  return Object.values(files).every((f) => fs.existsSync(f)) ? files : null;
+}
+
+function getStemWorker(setup) {
+  if (stemWorker) return stemWorker;
+  const { Worker } = require('node:worker_threads');
+  stemWorker = new Worker(path.join(__dirname, 'stems-worker.js'), { workerData: { modelPath: setup.model, runtimePath: setup.runtime } });
+  stemWorker.on('message', (m) => {
+    const job = stemJobs.get(m.jobId);
+    if (m.type === 'progress') mainWindow?.webContents.send('stems:progress', { trackId: m.jobId, done: m.done, total: m.total });
+    if (!job) return;
+    if (m.type === 'done') job.resolve({ ms: m.ms });
+    if (m.type === 'error') job.reject(new Error(m.message));
+    if (m.type === 'done' || m.type === 'error') stemJobs.delete(m.jobId);
+  });
+  stemWorker.on('error', (err) => {
+    for (const job of stemJobs.values()) job.reject(err);
+    stemJobs.clear();
+    stemWorker = null;
+  });
+  return stemWorker;
+}
+
+/** Separate one track (44.1 kHz stereo PCM from the renderer). One job at a time. */
+function separateStems(id, left, right) {
+  const setup = stemSetup();
+  if (!setup.available) return Promise.reject(new Error('AI stems are not installed.'));
+  if (!findTrack(id)) return Promise.reject(new Error('Track not found'));
+  if (cachedStems(id)) return Promise.resolve({ cached: true });
+  if (stemJobs.has(id)) return stemJobs.get(id).promise;
+  let resolve;
+  let reject;
+  const promise = new Promise((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  stemJobs.set(id, { promise, resolve, reject });
+  stemQueue = stemQueue.then(() => {
+    getStemWorker(setup).postMessage({ type: 'separate', jobId: id, left, right, outDir: stemDir(id) }, [left.buffer, right.buffer]);
+    return promise.catch(() => {});
+  });
+  return promise;
+}
+
 // ---------------------------------------------------------------- IPC
 
 function registerIpc() {
+  ipcMain.handle('stems:status', (_e, id) => {
+    const setup = stemSetup();
+    return { available: setup.available, ready: !!cachedStems(id), busy: stemJobs.has(id) };
+  });
+
+  ipcMain.handle('stems:separate', (_e, id, left, right) => separateStems(id, new Float32Array(left), new Float32Array(right)));
+
+  ipcMain.handle('stems:read', async (_e, id, name) => {
+    const files = cachedStems(id);
+    if (!files || !files[name]) throw new Error('Stems not ready');
+    const buf = await fsp.readFile(files[name]);
+    return buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
+  });
+
   ipcMain.handle('library:list', () => library.tracks.map(publicTrack));
 
   ipcMain.handle('library:update', (_e, id, patch) => {
     const t = findTrack(id);
     if (!t) return null;
-    const allowed = ['title', 'artist', 'bpm', 'beatOffset', 'cues', 'duration'];
+    const allowed = ['title', 'artist', 'bpm', 'beatOffset', 'cues', 'duration', 'key'];
     for (const key of allowed) if (key in patch) t[key] = patch[key];
     saveLibrary();
     return publicTrack(t);
@@ -428,6 +483,8 @@ function registerIpc() {
     if (deleteFile && path.dirname(path.resolve(t.file)) === path.resolve(paths.audio)) {
       await fsp.unlink(t.file).catch(() => {});
     }
+    // Cached AI stems belong to the track; they go with it.
+    if (!stemJobs.has(id)) await fsp.rm(stemDir(id), { recursive: true, force: true }).catch(() => {});
     saveLibrary();
     return true;
   });

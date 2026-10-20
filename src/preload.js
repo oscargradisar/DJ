@@ -29,5 +29,15 @@ contextBridge.exposeInMainWorld('cdj', {
     status: () => ipcRenderer.invoke('ytdlp:status'),
     update: () => ipcRenderer.invoke('ytdlp:update'),
   },
+  stems: {
+    status: (id) => ipcRenderer.invoke('stems:status', id),
+    separate: (id, left, right) => ipcRenderer.invoke('stems:separate', id, left, right),
+    read: (id, name) => ipcRenderer.invoke('stems:read', id, name),
+    onProgress: (fn) => {
+      const handler = (_e, payload) => fn(payload);
+      ipcRenderer.on('stems:progress', handler);
+      return () => ipcRenderer.removeListener('stems:progress', handler);
+    },
+  },
   openExternal: (url) => ipcRenderer.invoke('shell:openExternal', url),
 });

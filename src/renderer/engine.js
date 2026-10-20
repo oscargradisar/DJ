@@ -1,7 +1,12 @@
 // Audio engine: two decks → mixer → master limiter → speakers.
-// Built on the Web Audio API. Tempo changes are vinyl-style (pitch follows speed).
+// Built on the Web Audio API. Tempo changes are vinyl-style (pitch follows
+// speed) unless key lock is on. Each deck runs through a deck-fx worklet
+// (key shift / key lock / stems) before its EQ.
 
 const dbToGain = (db) => Math.pow(10, db / 20);
+
+export const STEMS = ['vocals', 'drums', 'instruments'];
+export const AI_STEM_NAMES = ['drums', 'bass', 'other', 'vocals'];
 
 export class Mixer {
   constructor() {
@@ -26,6 +31,18 @@ export class Mixer {
     this.crossfader = 0.5;
     this.curve = 'smooth';
     this.applyCrossfader();
+
+    // Key shift / stems processor. Decks play straight through until it's loaded.
+    this.fxReady = this.ctx.audioWorklet
+      .addModule(new URL('./deck-fx.worklet.js', import.meta.url))
+      .then(() => {
+        for (const d of Object.values(this.decks)) d.attachFx();
+        return true;
+      })
+      .catch((err) => {
+        console.error('Key shift / stems unavailable:', err);
+        return false;
+      });
   }
 
   resume() {
@@ -118,6 +135,124 @@ export class Deck {
     this.cuePoint = 0;
     this.loop = null; // { start, end, beats }
     this.listeners = new Set();
+
+    this.fx = null; // deck-fx worklet node, once loaded
+    this.keyShift = 0; // semitones (may be fractional after MATCH)
+    this.keyLock = false; // tempo changes leave pitch alone
+    this.stems = { vocals: 1, drums: 1, instruments: 1 };
+
+    // AI stems (prototype): when a track's separated stems are loaded, the deck
+    // plays them as four synced sources through these gains instead of the
+    // mixed buffer, and the DSP stem masks are bypassed.
+    this.bus = ctx.createGain(); // every source plays into this
+    this.bus.connect(this.trim);
+    this.aiStems = null; // { drums, bass, other, vocals } AudioBuffers
+    this.aiGains = {};
+    for (const n of AI_STEM_NAMES) {
+      this.aiGains[n] = ctx.createGain();
+      this.aiGains[n].connect(this.bus);
+    }
+    this.sources = []; // all running sources (1, or 4 with AI stems)
+  }
+
+  /** Where the sources play into (then through the fx node when loaded, then the EQ). */
+  get input() {
+    return this.bus;
+  }
+
+  attachFx() {
+    if (this.fx) return;
+    this.fx = new AudioWorkletNode(this.ctx, 'deck-fx', {
+      numberOfInputs: 1,
+      numberOfOutputs: 1,
+      outputChannelCount: [2],
+      channelCount: 2,
+      channelCountMode: 'explicit',
+      processorOptions: { pitch: this.pitchFactor, stems: this.stems },
+    });
+    this.bus.disconnect();
+    this.bus.connect(this.fx);
+    this.fx.connect(this.trim);
+    this.emit('fx');
+  }
+
+  /** Pitch change the fx node applies on top of playback speed. */
+  get pitchFactor() {
+    return 2 ** (this.keyShift / 12) / (this.keyLock ? this.rate : 1);
+  }
+
+  /** How far the heard key is from the track's own key, in semitones. */
+  get keyOffset() {
+    return this.keyShift + (this.keyLock ? 0 : 12 * Math.log2(this.rate));
+  }
+
+  sendFx() {
+    // With AI stems the stem levels are applied by aiGains, so the DSP masks stay off.
+    const stems = this.aiStems ? { vocals: 1, drums: 1, instruments: 1 } : this.stems;
+    this.fx?.port.postMessage({ pitch: this.pitchFactor, stems });
+  }
+
+  /** Apply the VOX / DRUMS / INST levels to the AI stem gains (INST = bass + other). */
+  applyAiGains() {
+    const t = this.ctx.currentTime;
+    const level = { vocals: this.stems.vocals, drums: this.stems.drums, bass: this.stems.instruments, other: this.stems.instruments };
+    for (const n of AI_STEM_NAMES) this.aiGains[n].gain.setTargetAtTime(level[n], t, 0.015);
+  }
+
+  /** Switch this deck to AI stems (buffers keyed drums/bass/other/vocals), keeping position. */
+  setAiStems(buffers) {
+    this.aiStems = buffers;
+    this.applyAiGains();
+    this.sendFx();
+    if (this.playing) this.startSource(this.position);
+    this.emit('stems');
+  }
+
+  setKeyShift(semitones) {
+    this.keyShift = Math.max(-12, Math.min(12, Math.round(semitones * 100) / 100));
+    this.sendFx();
+    this.emit('key');
+  }
+
+  setKeyLock(on) {
+    this.keyLock = !!on;
+    this.sendFx();
+    this.emit('key');
+  }
+
+  /**
+   * Shift this deck so it plays in the other deck's (heard) key, or its
+   * relative major/minor — same Camelot number, so they mix harmonically.
+   * Turns key lock on, so the match holds when tempo moves. Returns the shift
+   * in semitones, or null if either key is unknown.
+   */
+  matchKeyTo(other) {
+    const mine = this.track?.key;
+    const theirs = other.track?.key;
+    if (mine == null || mine < 0 || theirs == null || theirs < 0) return null;
+    const relMajor = (k) => (k % 12) + (k >= 12 ? 3 : 0);
+    let s = relMajor(theirs) + other.keyOffset - relMajor(mine);
+    s = ((s % 12) + 12) % 12;
+    if (s >= 6) s -= 12; // smallest move: −6…+6
+    this.keyLock = true;
+    this.setKeyShift(s);
+    return this.keyShift;
+  }
+
+  /** Stem level 0..1 (vocals | drums | instruments). */
+  setStem(name, level) {
+    if (!(name in this.stems)) return;
+    this.stems[name] = Math.max(0, Math.min(1, level));
+    if (this.aiStems) this.applyAiGains();
+    this.sendFx();
+    this.emit('stems');
+  }
+
+  resetStems() {
+    for (const k of STEMS) this.stems[k] = 1;
+    if (this.aiStems) this.applyAiGains();
+    this.sendFx();
+    this.emit('stems');
   }
 
   on(fn) {
@@ -159,42 +294,59 @@ export class Deck {
     this.pausedPos = 0;
     this.cuePoint = track.beatOffset && track.beatOffset < 2 ? track.beatOffset : 0;
     this.loop = null;
+    // A new track starts in its own key with every stem on; key lock is a deck setting and stays.
+    this.keyShift = 0;
+    for (const k of STEMS) this.stems[k] = 1;
+    this.aiStems = null;
+    this.applyAiGains();
+    this.sendFx();
     this.emit('load');
   }
 
   stopSource() {
-    if (this.source) {
-      this.source.onended = null;
+    for (const s of this.sources) {
+      s.onended = null;
       try {
-        this.source.stop();
+        s.stop();
       } catch {}
-      this.source.disconnect();
-      this.source = null;
+      s.disconnect();
     }
+    this.sources = [];
+    this.source = null;
   }
 
   startSource(at) {
     this.stopSource();
-    const src = this.ctx.createBufferSource();
-    src.buffer = this.buffer;
-    src.playbackRate.value = this.rate;
-    if (this.loop) {
-      src.loop = true;
-      src.loopStart = this.loop.start;
-      src.loopEnd = this.loop.end;
+    // One source for the mixed track, or four (one per AI stem) started together.
+    const plan = this.aiStems
+      ? AI_STEM_NAMES.map((n) => [this.aiStems[n], this.aiGains[n]])
+      : [[this.buffer, this.input]];
+    const when = this.ctx.currentTime;
+    const offset = Math.max(0, Math.min(at, this.duration - 0.001));
+    for (const [buffer, dest] of plan) {
+      const s = this.ctx.createBufferSource();
+      s.buffer = buffer;
+      s.playbackRate.value = this.rate;
+      if (this.loop) {
+        s.loop = true;
+        s.loopStart = this.loop.start;
+        s.loopEnd = this.loop.end;
+      }
+      s.connect(dest);
+      s.start(when, offset);
+      this.sources.push(s);
     }
-    src.connect(this.trim);
+    const src = this.sources[0];
     src.onended = () => {
       if (this.source === src) {
-        this.source = null;
+        this.stopSource();
         this.playing = false;
         this.pausedPos = this.duration;
         this.emit('state');
       }
     };
     this.startPos = at;
-    this.startTime = this.ctx.currentTime;
-    src.start(0, Math.max(0, Math.min(at, this.duration - 0.001)));
+    this.startTime = when;
     this.source = src;
   }
 
@@ -251,7 +403,8 @@ export class Deck {
       if (this.loop && pos < this.loop.start) this.loop = null;
     }
     this.rate = rate;
-    if (this.source) this.source.playbackRate.setValueAtTime(rate, this.ctx.currentTime);
+    for (const s of this.sources) s.playbackRate.setValueAtTime(rate, this.ctx.currentTime);
+    if (this.keyLock) this.sendFx(); // pitch correction follows the tempo
     if (!silent) this.emit('rate');
   }
 
@@ -304,10 +457,10 @@ export class Deck {
         this.startPos = p;
         this.startTime = this.ctx.currentTime;
       }
-      if (this.source) {
-        this.source.loopStart = start;
-        this.source.loopEnd = end;
-        this.source.loop = true;
+      for (const s of this.sources) {
+        s.loopStart = start;
+        s.loopEnd = end;
+        s.loop = true;
       }
     }
     this.emit('loop');
@@ -319,7 +472,7 @@ export class Deck {
       const p = this.position;
       this.startPos = p;
       this.startTime = this.ctx.currentTime;
-      if (this.source) this.source.loop = false;
+      for (const s of this.sources) s.loop = false;
     }
     this.loop = null;
     this.emit('loop');

@@ -108,7 +108,7 @@ app.on('browser-window-created', (_e, win) => {
         report.pasteAgain = await paste('https://www.youtube.com/watch?v=ccA');
         report.pasteNoLicenseButCc = await paste('https://www.youtube.com/watch?v=ccX');
         report.pasteNoLicenseNotCc = await paste('https://www.youtube.com/watch?v=nolic');
-        report.libraryRows = await js(`[...document.querySelectorAll('#libBody tr')].map(tr => tr.children[1].textContent + ' | ' + tr.children[5].textContent)`);
+        report.libraryRows = await js(`[...document.querySelectorAll('#libBody tr')].map(tr => tr.children[1].textContent + ' | ' + tr.children[6].textContent)`);
         await js(`document.querySelector('#deckA .play').click()`);
         await sleep(300);
         const firstWeb = await js(`document.querySelector('#libBody tr').dataset.id`);

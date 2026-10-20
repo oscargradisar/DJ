@@ -1,6 +1,6 @@
 // Commons DJ — UI
-import { Mixer, peakDb } from './engine.js';
-import { mixToMono, computeWaveform, overview, detectTempo } from './analysis.js';
+import { Mixer, peakDb, STEMS, AI_STEM_NAMES } from './engine.js';
+import { mixToMono, computeWaveform, overview, detectTempo, detectKey, keyName, camelot, transposeKey } from './analysis.js';
 
 const api = window.cdj;
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -8,7 +8,9 @@ const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
 
 const mixer = new Mixer();
 const DECKS = ['A', 'B'];
+// Canvas colours, read from the current theme's CSS variables (see setTheme).
 const ACCENT = { A: [255, 159, 67], B: [60, 200, 245] };
+const INK = { ink: '255,255,255', shade: '11,12,14', hi: [170, 182, 196] };
 const HOTCUE_COLORS = ['#ff5c6c', '#42d392', '#8b7bff', '#ffd24d'];
 
 const state = {
@@ -20,6 +22,7 @@ const state = {
   played: new Map(), // trackId -> track (web tracks played this session, for credits)
   ccResults: [],
   jobs: new Map(), // jobId -> { el, url }
+  stemJobs: new Map(), // trackId -> { done, total } while AI stems are being made
 };
 
 // ------------------------------------------------------------------ helpers
@@ -46,14 +49,22 @@ function toast(message, kind = 'info') {
   setTimeout(() => el.remove(), kind === 'error' ? 6000 : 3200);
 }
 
+// No-gate build: tracks aren't license-checked, so anything that isn't
+// clearly CC shows as UNCHECKED rather than defaulting to "CC".
 function shortLicense(lic) {
-  if (!lic) return 'CC';
+  if (!lic) return 'UNCHECKED';
   if (/public\s*domain|cc0/i.test(lic)) return 'PUBLIC DOMAIN';
   if (/attribution/i.test(lic) || /cc[\s-]?by/i.test(lic)) {
     const m = lic.match(/cc[\s-]?by(?:[\s-](?:sa|nd|nc))*(?:[\s-]\d\.\d)?/i);
     return m ? m[0].toUpperCase().replace(/\s/g, '-') : 'CC BY';
   }
-  return 'CC';
+  if (/creative\s*commons/i.test(lic)) return 'CC';
+  return 'UNCHECKED';
+}
+
+/** "8A Am" for a stored key (0–23); '' when unknown. */
+function keyLabel(key) {
+  return key == null || key < 0 ? '' : `${camelot(key)} ${keyName(key)}`;
 }
 
 function cleanErr(err) {
@@ -186,6 +197,11 @@ function buildDeck(name) {
     hotcues: $$('.hc', root),
     loops: $$('.lp', root),
     tap: $('.tap', root),
+    keyRead: $('.key-read', root),
+    keyLock: $('.key-lock', root),
+    keyMatch: $('.key-match', root),
+    stems: $$('.stem', root),
+    stemLabel: $('.stemrow .label', root),
   };
   ui[name] = d;
 
@@ -237,6 +253,30 @@ function buildDeck(name) {
   $('.beat-here', root).addEventListener('click', () => beatHere(name));
   setupTap(name);
 
+  // Key: shift in semitones without touching tempo, key lock, match the other deck.
+  $('.key-down', root).addEventListener('click', () => deck.setKeyShift(Math.round(deck.keyShift) - 1));
+  $('.key-up', root).addEventListener('click', () => deck.setKeyShift(Math.round(deck.keyShift) + 1));
+  d.keyRead.addEventListener('click', () => deck.setKeyShift(0));
+  d.keyLock.addEventListener('click', () => deck.setKeyLock(!deck.keyLock));
+  d.keyMatch.addEventListener('click', () => matchKey(name));
+
+  // Stems: click toggles, Shift-click solos, right-click turns everything back on.
+  d.stems.forEach((btn) => {
+    const stem = btn.dataset.stem;
+    btn.addEventListener('click', (e) => {
+      if (e.shiftKey) {
+        const solo = STEMS.every((s) => (s === stem ? deck.stems[s] > 0 : deck.stems[s] === 0));
+        STEMS.forEach((s) => deck.setStem(s, solo || s === stem ? 1 : 0));
+      } else {
+        deck.setStem(stem, deck.stems[stem] > 0 ? 0 : 1);
+      }
+    });
+    btn.addEventListener('contextmenu', (e) => {
+      e.preventDefault();
+      deck.resetStems();
+    });
+  });
+
   d.overview.addEventListener('pointerdown', (e) => {
     if (!deck.buffer) return;
     const seekTo = (ev) => {
@@ -255,6 +295,8 @@ function buildDeck(name) {
     if (type === 'loop' || type === 'load') d.loops.forEach((b) => b.classList.toggle('on', deck.loop?.beats === Number(b.dataset.beats)));
     if (type === 'rate' || type === 'load' || type === 'sync') renderTempo(name);
     if (type === 'sync') syncTempoSlider(name);
+    if (type === 'key' || type === 'rate' || type === 'load' || type === 'sync' || type === 'fx') renderKey(name);
+    if (type === 'stems' || type === 'load' || type === 'fx') renderStems(name);
   });
 
   setupDeckDrop(root, name);
@@ -320,6 +362,120 @@ function doSync(name) {
   if (!deck.syncTo(other)) return toast('Tempos are too far apart to sync.', 'error');
   ui[name].sync.classList.add('on');
   setTimeout(() => ui[name].sync.classList.remove('on'), 500);
+}
+
+const fmtSemis = (s) => {
+  const r = Math.round(s * 10) / 10;
+  return `${r > 0 ? '+' : r < 0 ? '−' : '±'}${Math.abs(r) % 1 ? Math.abs(r).toFixed(1) : Math.abs(r)}`;
+};
+
+function renderKey(name) {
+  const deck = mixer.decks[name];
+  const d = ui[name];
+  const key = deck.track?.key;
+  const offset = deck.keyOffset;
+  const shifted = Math.abs(offset) >= 0.05;
+  d.keyLock.classList.toggle('on', deck.keyLock);
+  d.keyRead.classList.toggle('shifted', shifted);
+  d.keyRead.classList.toggle('unknown', key == null || key < 0);
+  const noFx = !deck.fx;
+  if (key == null || key < 0) {
+    d.keyRead.textContent = deck.track ? (shifted ? `? ${fmtSemis(offset)}` : 'no key') : '—';
+    d.keyRead.title = deck.track ? 'No clear key found in this track.' : '';
+  } else if (!shifted) {
+    d.keyRead.innerHTML = `${escapeHtml(camelot(key))} <span class="dim">${escapeHtml(keyName(key))}</span>`;
+    d.keyRead.title = `Track key ${keyName(key)} (${camelot(key)}).`;
+  } else {
+    // The key you hear: rounded to the nearest semitone, with the exact shift alongside.
+    const heard = transposeKey(key, offset);
+    const off = Math.abs(offset - Math.round(offset)) >= 0.25 ? '~' : '';
+    d.keyRead.textContent = `${off}${camelot(heard)} ${keyName(heard)} ${fmtSemis(offset)}`;
+    d.keyRead.title = `Track key ${keyName(key)} (${camelot(key)}), playing ${fmtSemis(offset)} semitones → ${keyName(heard)} (${camelot(heard)}).` +
+      (deck.keyLock ? '' : ' Includes the pitch change from the tempo slider (key lock is off).') + ' Click to reset the key shift.';
+  }
+  if (noFx) d.keyRead.title = 'Key shift is still loading…';
+}
+
+function renderStems(name) {
+  const deck = mixer.decks[name];
+  ui[name].stems.forEach((btn) => {
+    btn.classList.toggle('off', deck.stems[btn.dataset.stem] === 0);
+    btn.disabled = !deck.fx;
+  });
+  const label = ui[name].stemLabel;
+  const job = state.stemJobs.get(deck.track?.id);
+  label.classList.toggle('ai', !!deck.aiStems);
+  if (deck.aiStems) {
+    label.textContent = 'Stems · AI';
+    label.title = 'Using AI-separated stems for this track (HT-Demucs).';
+  } else if (job) {
+    label.textContent = job.total ? `AI ${Math.round((100 * job.done) / job.total)}%` : 'AI …';
+    label.title = 'Separating this track with AI in the background — the quick DSP stems work meanwhile.';
+  } else {
+    label.textContent = 'Stems';
+    label.title = 'Real-time DSP stems.';
+  }
+}
+
+// ------------------------------------------------------------------ AI stems (prototype)
+
+async function loadAiStems(name, trackId) {
+  const deck = mixer.decks[name];
+  const buffers = {};
+  for (const n of AI_STEM_NAMES) {
+    const data = await api.stems.read(trackId, n);
+    buffers[n] = await mixer.ctx.decodeAudioData(data);
+  }
+  if (deck.track?.id === trackId) deck.setAiStems(buffers);
+}
+
+/** Resample to 44.1 kHz stereo for the model. */
+async function toModelPcm(buffer) {
+  const len = Math.ceil(buffer.duration * 44100);
+  const off = new OfflineAudioContext(2, len, 44100);
+  const src = off.createBufferSource();
+  src.buffer = buffer;
+  src.connect(off.destination);
+  src.start();
+  const r = await off.startRendering();
+  return [r.getChannelData(0), r.getChannelData(1)];
+}
+
+/** After a track loads: use cached AI stems, or separate it once in the background. */
+async function prepareAiStems(name, track, buffer) {
+  try {
+    const st = await api.stems.status(track.id);
+    if (!st.available) return; // not installed: DSP stems only
+    if (st.ready) return await loadAiStems(name, track.id);
+    if (state.stemJobs.has(track.id)) return;
+    state.stemJobs.set(track.id, { done: 0, total: 0 });
+    DECKS.forEach(renderStems);
+    const [left, right] = await toModelPcm(buffer);
+    await api.stems.separate(track.id, left, right);
+    state.stemJobs.delete(track.id);
+    for (const n of DECKS) if (mixer.decks[n].track?.id === track.id) await loadAiStems(n, track.id);
+    toast(`AI stems ready for “${track.title}”.`);
+  } catch (err) {
+    state.stemJobs.delete(track.id);
+    console.error(err);
+    toast(`AI stems failed: ${cleanErr(err)} — using DSP stems.`, 'error');
+  } finally {
+    DECKS.forEach(renderStems);
+  }
+}
+
+function matchKey(name) {
+  const deck = mixer.decks[name];
+  const other = mixer.decks[name === 'A' ? 'B' : 'A'];
+  if (!deck.track || !other.track) return toast('Load tracks on both decks to match keys.');
+  if (deck.track.key == null || deck.track.key < 0 || other.track.key == null || other.track.key < 0) {
+    return toast('Both tracks need a detected key to match.');
+  }
+  const s = deck.matchKeyTo(other);
+  const heard = transposeKey(other.track.key, other.keyOffset);
+  toast(`Deck ${name} ${Math.abs(s) < 0.05 ? 'is already' : `shifted ${fmtSemis(s)} semitones —`} in key with deck ${other.name} (${camelot(heard)}). Key lock is on.`);
+  ui[name].keyMatch.classList.add('on');
+  setTimeout(() => ui[name].keyMatch.classList.remove('on'), 500);
 }
 
 function markPlayed(name) {
@@ -462,6 +618,12 @@ async function loadToDeck(name, trackId) {
         patch.bpm = 0; // analysed, no clear beat
       }
     }
+    if (track.key == null) {
+      d.artist.textContent = 'Analyzing key…';
+      await new Promise((r) => setTimeout(r, 0));
+      const k = detectKey(mono, buffer.sampleRate);
+      patch.key = k ? k.key : -1; // -1: analysed, no clear key
+    }
     if (Object.keys(patch).length) await saveTrack(track, patch);
     if (track.bpm === 0) track.bpm = null;
 
@@ -471,6 +633,7 @@ async function loadToDeck(name, trackId) {
     // A fresh load starts at normal speed; keep the slider in step.
     d.tempo.value = 0;
     deck.setRate(1);
+    prepareAiStems(name, track, buffer); // background; DSP stems work meanwhile
   } catch (err) {
     console.error(err);
     toast(`Couldn't load “${track.title}”: ${cleanErr(err)}`, 'error');
@@ -561,11 +724,12 @@ function fitCanvas(canvas) {
 
 function waveColor(name, bass, alpha = 1) {
   const [r, g, b] = ACCENT[name];
-  // Highs lean toward cool white, bass toward the deck colour.
+  // Highs lean toward the theme's high colour, bass toward the deck colour.
+  const [hr, hg, hb] = INK.hi;
   const k = Math.min(1, bass * 1.4);
-  const rr = Math.round(170 + (r - 170) * k);
-  const gg = Math.round(182 + (g - 182) * k);
-  const bb = Math.round(200 + (b - 200) * k);
+  const rr = Math.round(hr + (r - hr) * k);
+  const gg = Math.round(hg + (g - hg) * k);
+  const bb = Math.round(hb + (b - hb) * k);
   return `rgba(${rr},${gg},${bb},${alpha})`;
 }
 
@@ -632,7 +796,7 @@ function drawScrolling(name) {
         if (bt < 0) continue;
         const x = Math.round(cx + (bt - pos) * pps) + 0.5;
         const bar = n % 4 === 0;
-        ctx.fillStyle = bar ? 'rgba(255,255,255,0.55)' : 'rgba(255,255,255,0.22)';
+        ctx.fillStyle = `rgba(${INK.ink},${bar ? 0.55 : 0.22})`;
         const len = (bar ? 9 : 5) * dpr;
         ctx.fillRect(x, 0, dpr, len);
         ctx.fillRect(x, H - len, dpr, len);
@@ -652,18 +816,18 @@ function drawScrolling(name) {
       ctx.fill();
     };
     (t?.cues || []).forEach((c, i) => c != null && marker(c, HOTCUE_COLORS[i]));
-    marker(deck.cuePoint, '#ffffff');
+    marker(deck.cuePoint, `rgb(${INK.ink})`);
 
     // Shade the past.
-    ctx.fillStyle = 'rgba(11,12,14,0.45)';
+    ctx.fillStyle = `rgba(${INK.shade},0.45)`;
     ctx.fillRect(0, 0, cx, H);
   } else {
-    ctx.fillStyle = '#2a2e35';
+    ctx.fillStyle = `rgba(${INK.ink},0.2)`;
     ctx.fillRect(0, mid, W, 1);
   }
 
   // Playhead
-  ctx.fillStyle = '#ffffff';
+  ctx.fillStyle = `rgb(${INK.ink})`;
   ctx.fillRect(cx - dpr, 0, 2 * dpr, H);
 }
 
@@ -701,7 +865,7 @@ function drawOverview(name) {
   const dpr = window.devicePixelRatio || 1;
   const px = (t) => (t / deck.duration) * W;
   const x = px(deck.position);
-  ctx.fillStyle = 'rgba(11,12,14,0.55)';
+  ctx.fillStyle = `rgba(${INK.shade},0.55)`;
   ctx.fillRect(0, 0, x, H);
   if (deck.loop) {
     ctx.fillStyle = 'rgba(66,211,146,0.25)';
@@ -712,7 +876,7 @@ function drawOverview(name) {
     ctx.fillStyle = HOTCUE_COLORS[i];
     ctx.fillRect(px(c), 0, 2 * dpr, H);
   });
-  ctx.fillStyle = '#fff';
+  ctx.fillStyle = `rgb(${INK.ink})`;
   ctx.fillRect(px(deck.cuePoint), 0, dpr, 6 * dpr);
   ctx.fillRect(x - dpr / 2, 0, 2 * dpr, H);
 }
@@ -769,7 +933,7 @@ async function refreshLibrary() {
 function renderLibrary() {
   const q = state.filter.trim().toLowerCase();
   const rows = q
-    ? state.tracks.filter((t) => `${t.title} ${t.artist} ${t.source?.uploader || ''}`.toLowerCase().includes(q))
+    ? state.tracks.filter((t) => `${t.title} ${t.artist} ${t.source?.uploader || ''} ${keyLabel(t.key)}`.toLowerCase().includes(q))
     : state.tracks;
   const onA = mixer.decks.A.track?.id;
   const onB = mixer.decks.B.track?.id;
@@ -787,6 +951,7 @@ function renderLibrary() {
         <td title="${escapeHtml(t.title)}">${escapeHtml(t.title)}</td>
         <td title="${escapeHtml(t.artist)}">${escapeHtml(t.artist)}</td>
         <td class="num">${t.bpm ? Number(t.bpm).toFixed(1) : ''}</td>
+        <td class="c-key" title="${escapeHtml(keyName(t.key))}">${escapeHtml(camelot(t.key))} <span class="dim">${escapeHtml(keyName(t.key))}</span></td>
         <td class="num">${fmtTime(t.duration)}</td>
         <td>${src}</td>
         <td>${web ? '<button class="row-act" data-act="credit" title="Copy attribution">credit</button>' : ''}<button class="row-act" data-act="remove" title="Remove from library">✕</button></td>
@@ -812,7 +977,7 @@ async function removeTrack(id) {
 function attribution(t) {
   const s = t.source || {};
   const by = s.uploader || t.artist || 'unknown creator';
-  return `“${t.title}” by ${by} — ${s.url || ''} — ${s.license || 'Creative Commons'}`;
+  return `“${t.title}” by ${by} — ${s.url || ''} — ${s.license || 'license not checked'}`;
 }
 
 function setupLibrary() {
@@ -909,14 +1074,59 @@ function setCcStatus(text, error = false) {
   el.classList.toggle('error', error);
 }
 
+// Over this, a result is probably a mix rather than a single track.
+const LONG_RESULT_SECONDS = 20 * 60;
+
+function fmtDuration(sec) {
+  if (!sec) return '';
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const s = String(Math.floor(sec % 60)).padStart(2, '0');
+  return h ? `${h}:${String(m).padStart(2, '0')}:${s}` : `${m}:${s}`;
+}
+
+// What exactly was searched, and what came back — so a missing video can be
+// traced to the query, the result limit, or the app dropping it.
+function renderCcInfo(s) {
+  const el = $('#ccInfo');
+  if (!s) {
+    el.hidden = true;
+    return;
+  }
+  const long = s.results.filter((r) => r.duration > LONG_RESULT_SECONDS).length;
+  const live = s.results.filter((r) => !r.duration).length;
+  el.innerHTML = `
+    <div class="row">
+      <span>“<b>${escapeHtml(s.query)}</b>” on YouTube</span>
+      <span>showing <b>${s.results.length}</b> of <b>${s.received}</b> returned (limit ${s.limit})</span>
+      ${long ? `<span class="warn">${long} over 20 min</span>` : ''}
+      ${live ? `<span class="warn">${live} live / no length</span>` : ''}
+      ${s.dropped.length ? `<span class="warn">${s.dropped.length} hidden</span>` : ''}
+      <span>${(s.ms / 1000).toFixed(1)}s</span>
+      <a class="open" data-url="${escapeHtml(s.url)}">Open on YouTube to compare</a>
+    </div>
+    <details>
+      <summary>Details</summary>
+      <div class="row">Filter: <b>${escapeHtml(s.filter)}</b></div>
+      <div class="row"><code>${escapeHtml(s.url)}</code></div>
+      ${s.dropped.map((d) => `<div class="row warn">Hidden: ${escapeHtml(d.title || d.id)} — ${escapeHtml(d.reason)}</div>`).join('')}
+    </details>`;
+  el.hidden = false;
+}
+
 function renderCcResults() {
   $('#ccResults').innerHTML = state.ccResults
     .map((r) => `
       <div class="cc-item" data-vid="${escapeHtml(r.id)}">
-        ${r.thumbnail ? `<img src="${escapeHtml(r.thumbnail)}" alt="" loading="lazy" referrerpolicy="no-referrer" />` : '<div class="thumb"></div>'}
+        <div class="thumb-wrap">
+          ${r.thumbnail ? `<img src="${escapeHtml(r.thumbnail)}" alt="" loading="lazy" referrerpolicy="no-referrer" />` : '<div class="thumb"></div>'}
+          ${r.rank ? `<span class="rank">#${r.rank}</span>` : ''}
+          ${r.duration ? `<span class="dur ${r.duration > LONG_RESULT_SECONDS ? 'long' : ''}">${fmtDuration(r.duration)}</span>` : ''}
+        </div>
         <div class="meta">
           <div class="ttl" title="${escapeHtml(r.title)}">${escapeHtml(r.title)}</div>
-          <div class="sub">${escapeHtml(r.channel)}${r.duration ? ` · ${fmtTime(r.duration)}` : ''} · <a class="open" data-url="${escapeHtml(r.url)}">open</a></div>
+          <div class="sub">${escapeHtml(r.channel)} · <a class="open" data-url="${escapeHtml(r.url)}">open</a></div>
+          <div class="vid">${escapeHtml(r.id)}</div>
           <div class="msg"></div>
         </div>
         <button class="btn ${r.inLibrary ? '' : 'primary'}" data-get="${escapeHtml(r.url)}" ${r.inLibrary ? 'disabled' : ''}>${r.inLibrary ? 'In library' : 'Add'}</button>
@@ -930,7 +1140,7 @@ async function startDownload(url, itemEl) {
   const btn = itemEl ? $('[data-get]', itemEl) : null;
   if (btn) {
     btn.disabled = true;
-    btn.textContent = 'Checking…';
+    btn.textContent = 'Fetching…';
   }
   state.jobs.set(id, { el: itemEl, url });
   try {
@@ -964,7 +1174,7 @@ function onDownloadProgress(p) {
       msg.textContent = p.message;
       msg.classList.add('error');
     } else {
-      btn.textContent = p.stage === 'setup' ? 'Setting up…' : 'Checking…';
+      btn.textContent = p.stage === 'setup' ? 'Setting up…' : 'Fetching…';
       msg.textContent = p.message || '';
       msg.classList.remove('error');
     }
@@ -992,11 +1202,14 @@ function setupCc() {
     e.preventDefault();
     const q = $('#ccQuery').value.trim();
     if (!q) return;
-    setCcStatus('Searching YouTube’s Creative Commons catalogue…');
+    setCcStatus(`Searching YouTube for “${q}”…`);
     $('#ccResults').innerHTML = '';
+    renderCcInfo(null);
     try {
-      state.ccResults = await api.cc.search(q);
-      setCcStatus(state.ccResults.length ? '' : 'No Creative Commons results. Try broader words.');
+      const search = await api.cc.search(q);
+      state.ccResults = search.results;
+      setCcStatus(state.ccResults.length ? '' : 'No results. Try broader words.');
+      renderCcInfo(search);
       renderCcResults();
     } catch (err) {
       setCcStatus(`Search failed: ${cleanErr(err)}`, true);
@@ -1009,13 +1222,18 @@ function setupCc() {
     const url = $('#ccLink').value.trim();
     if (!url) return;
     $('#ccLink').value = '';
-    setCcStatus('Checking license…');
+    setCcStatus('Fetching video info…');
     startDownload(url, null);
   });
 
   $('#ccResults').addEventListener('click', (e) => {
     const get = e.target.closest('[data-get]');
     if (get && !get.disabled) return startDownload(get.dataset.get, get.closest('.cc-item'));
+    const open = e.target.closest('a.open');
+    if (open) api.openExternal(open.dataset.url);
+  });
+
+  $('#ccInfo').addEventListener('click', (e) => {
     const open = e.target.closest('a.open');
     if (open) api.openExternal(open.dataset.url);
   });
@@ -1080,6 +1298,17 @@ function setupTabs() {
       if (tab.dataset.tab === 'cc') $('#ccQuery').focus();
     }),
   );
+
+  // Expand: the library / search panel covers the decks. Esc goes back.
+  const max = $('#browseMax');
+  const setMax = (on) => {
+    document.body.classList.toggle('browse-max', on);
+    max.textContent = on ? 'Collapse ⤡' : 'Expand ⤢';
+  };
+  max.addEventListener('click', () => setMax(!document.body.classList.contains('browse-max')));
+  window.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && document.body.classList.contains('browse-max') && !e.target.closest?.('input, textarea, select, dialog')) setMax(false);
+  });
 }
 
 function setupZoom() {
@@ -1141,6 +1370,59 @@ function setupKeyboard() {
 
 // ------------------------------------------------------------------ boot
 
+function setTheme(name) {
+  document.body.dataset.theme = name;
+  const css = getComputedStyle(document.body);
+  const rgb = (v) => css.getPropertyValue(v).trim();
+  INK.ink = rgb('--ink-rgb');
+  INK.shade = rgb('--shade-rgb');
+  INK.hi = rgb('--wave-hi-rgb').split(',').map(Number);
+  ACCENT.A = rgb('--a-rgb').split(',').map(Number);
+  ACCENT.B = rgb('--b-rgb').split(',').map(Number);
+  DECKS.forEach((n) => (state.overviewImg[n] = null)); // redraw overviews in the new colours
+  try {
+    localStorage.setItem('theme', name);
+  } catch {}
+}
+{
+  let saved = 'light';
+  try {
+    saved = localStorage.getItem('theme') || 'light';
+  } catch {}
+  $('#themeSel').value = saved;
+  setTheme(saved);
+  $('#themeSel').addEventListener('change', (e) => setTheme(e.target.value));
+
+  // Optional background picture of the user's choosing.
+  // shortcut: stored as a data URL in localStorage (~5 MB cap), move to the app data folder if bigger images are needed.
+  const applyBg = (url) => document.body.style.setProperty('--user-bg', url ? `url("${url}")` : 'none');
+  try {
+    applyBg(localStorage.getItem('bg'));
+  } catch {}
+  $('#bgBtn').addEventListener('click', () => $('#bgFile').click());
+  $('#bgBtn').addEventListener('contextmenu', (e) => {
+    e.preventDefault();
+    applyBg(null);
+    try {
+      localStorage.removeItem('bg');
+    } catch {}
+  });
+  $('#bgFile').addEventListener('change', () => {
+    const file = $('#bgFile').files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      applyBg(reader.result);
+      try {
+        localStorage.setItem('bg', reader.result);
+      } catch {
+        toast('Picture is too big to remember after restart — it shows for now.', 'error');
+      }
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
 DECKS.forEach(buildDeck);
 buildMixer();
 setupLibrary();
@@ -1154,6 +1436,16 @@ setupYtdlpChip();
 DECKS.forEach((n) => {
   renderTempo(n);
   renderHotcues(n);
+  renderKey(n);
+  renderStems(n);
+});
+api.stems.onProgress(({ trackId, done, total }) => {
+  if (!state.stemJobs.has(trackId)) return;
+  state.stemJobs.set(trackId, { done, total });
+  DECKS.forEach(renderStems);
+});
+mixer.fxReady.then((ok) => {
+  if (!ok) toast('Key shift and stems couldn’t start on this computer — decks still play normally.', 'error');
 });
 refreshLibrary();
 requestAnimationFrame(frame);

@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta http-equiv="Content-Security-Policy"
         content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; media-src 'self' blob:; connect-src 'self'" />
-  <title>Commons DJ</title>
+  <title>Commons DJ (no license gate)</title>
   <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
@@ -15,12 +15,12 @@
     </div>
     <div class="top-center">
       <div class="master">
-        <span class="label">MASTER</span>
+        <span class="label">Volume</span>
         <input id="masterVol" class="hslider" type="range" min="0" max="1" step="0.01" value="0.85" aria-label="Master volume" />
         <div class="meter meter-h" id="masterMeter"><div class="meter-fill"></div><div class="meter-peak"></div></div>
       </div>
       <div class="curve">
-        <span class="label">X-FADE</span>
+        <span class="label">Crossfade</span>
         <div class="seg" id="curveSeg" role="radiogroup" aria-label="Crossfader curve">
           <button data-curve="smooth" class="on" role="radio" aria-checked="true">Blend</button>
           <button data-curve="cut" role="radio" aria-checked="false">Cut</button>
@@ -28,6 +28,8 @@
       </div>
     </div>
     <div class="top-right">
+      <select id="themeSel" aria-label="Theme" title="Theme"><option value="light">Light</option><option value="dark">Dark</option><option value="skrillex">Skrillex-style</option></select>
+      <button class="chip" id="bgBtn" title="Put your own picture behind the app (right-click to remove)">Background…</button><input id="bgFile" type="file" accept="image/*" hidden />
       <button class="chip" id="ytdlpChip" title="yt-dlp status">yt-dlp …</button>
       <button class="chip" id="creditsBtn" title="Credits for Creative Commons tracks you've played">Credits <span id="creditsCount">0</span></button>
       <button class="chip icon" id="helpBtn" title="Keyboard shortcuts (?)">?</button>
@@ -56,11 +58,11 @@
       <div class="strips">
         <div class="strip" data-deck="A">
           <div class="knobs">
-            <div class="knob" data-param="trim" data-label="TRIM"></div>
-            <div class="knob" data-param="high" data-label="HI"></div>
-            <div class="knob" data-param="mid" data-label="MID"></div>
-            <div class="knob" data-param="low" data-label="LOW"></div>
-            <div class="knob" data-param="filter" data-label="FILTER"></div>
+            <div class="knob" data-param="trim" data-label="Gain"></div>
+            <div class="knob" data-param="high" data-label="High"></div>
+            <div class="knob" data-param="mid" data-label="Mid"></div>
+            <div class="knob" data-param="low" data-label="Low"></div>
+            <div class="knob" data-param="filter" data-label="Filter"></div>
           </div>
           <div class="fader-wrap">
             <div class="meter meter-v"><div class="meter-fill"></div><div class="meter-peak"></div></div>
@@ -69,11 +71,11 @@
         </div>
         <div class="strip" data-deck="B">
           <div class="knobs">
-            <div class="knob" data-param="trim" data-label="TRIM"></div>
-            <div class="knob" data-param="high" data-label="HI"></div>
-            <div class="knob" data-param="mid" data-label="MID"></div>
-            <div class="knob" data-param="low" data-label="LOW"></div>
-            <div class="knob" data-param="filter" data-label="FILTER"></div>
+            <div class="knob" data-param="trim" data-label="Gain"></div>
+            <div class="knob" data-param="high" data-label="High"></div>
+            <div class="knob" data-param="mid" data-label="Mid"></div>
+            <div class="knob" data-param="low" data-label="Low"></div>
+            <div class="knob" data-param="filter" data-label="Filter"></div>
           </div>
           <div class="fader-wrap">
             <input class="vslider channel-fader" type="range" min="0" max="1" step="0.005" value="1" aria-label="Deck B volume" />
@@ -94,19 +96,20 @@
   <section class="browser">
     <nav class="tabs" role="tablist">
       <button class="tab on" data-tab="library" role="tab" aria-selected="true">Library <span id="libCount" class="count">0</span></button>
-      <button class="tab" data-tab="cc" role="tab" aria-selected="false">Creative Commons search</button>
+      <button class="tab" data-tab="cc" role="tab" aria-selected="false">YouTube search</button>
       <div class="tab-tools" data-for="library">
         <input id="libFilter" class="field" type="search" placeholder="Filter library  ( / )" />
         <button class="btn" id="addFiles">Add files</button>
         <button class="btn ghost" id="openFolder">Open download folder</button>
       </div>
+      <button class="btn ghost" id="browseMax" title="Give the library / search the full window (Esc to go back)">Expand ⤢</button>
     </nav>
 
     <div class="panel on" data-panel="library">
       <div class="table-wrap">
         <table class="lib">
           <thead>
-            <tr><th class="c-load">Load</th><th>Title</th><th>Artist</th><th class="num">BPM</th><th class="num">Time</th><th>Source</th><th class="c-act"></th></tr>
+            <tr><th class="c-load">Load</th><th>Title</th><th>Artist</th><th class="num">BPM</th><th class="c-key">Key</th><th class="num">Time</th><th>Source</th><th class="c-act"></th></tr>
           </thead>
           <tbody id="libBody"></tbody>
         </table>
@@ -120,19 +123,19 @@
     <div class="panel" data-panel="cc">
       <div class="cc-bar">
         <form id="ccSearchForm" class="cc-form">
-          <input id="ccQuery" class="field grow" type="search" placeholder="Search Creative Commons music on YouTube — try “lofi beat”, “house loop”, “funk breakbeat”" />
+          <input id="ccQuery" class="field grow" type="search" placeholder="Search YouTube — try “lofi beat”, “house loop”, “funk breakbeat”" />
           <button class="btn primary" type="submit">Search</button>
         </form>
         <form id="ccLinkForm" class="cc-form">
-          <input id="ccLink" class="field grow" type="url" placeholder="…or paste a link to a Creative Commons video" />
+          <input id="ccLink" class="field grow" type="url" placeholder="…or paste a video link" />
           <button class="btn" type="submit">Get</button>
         </form>
       </div>
-      <p class="cc-note">
-        Every download is license-checked first, and anything that isn't Creative Commons or public domain is skipped.
-        CC BY means you credit the creator — the <b>Credits</b> button collects attributions for what you play.
+      <p class="cc-note" title="Search shows the same results as youtube.com. Downloads are not license-checked, so tracks without a CC license show as UNCHECKED.">
+        <b>Dev build:</b> plain YouTube search (no Creative Commons filter) and no license check — non-CC tracks show as UNCHECKED.
       </p>
       <div id="ccStatus" class="cc-status" hidden></div>
+      <div id="ccInfo" class="cc-info" hidden></div>
       <div id="ccResults" class="cc-results"></div>
     </div>
   </section>
@@ -207,32 +210,46 @@
         </div>
         <canvas class="overview"></canvas>
         <div class="row transport">
-          <button class="pad cue" title="Cue">CUE</button>
+          <button class="pad cue" title="Cue: set or jump back to the cue point">Cue</button>
           <button class="pad play" title="Play / pause">▶</button>
-          <button class="pad sync" title="Match tempo and beat to the other deck">SYNC</button>
+          <button class="pad sync" title="Match tempo and beat to the other deck">Sync</button>
           <div class="nudge">
             <button class="mini nudge-back" title="Nudge back (hold)">◀◀</button>
             <button class="mini nudge-fwd" title="Nudge forward (hold)">▶▶</button>
           </div>
         </div>
-        <div class="row hotcues">
+        <div class="row hotcues" title="Hot cues: click an empty pad to save a spot, click it again to jump there, right-click to clear">
           <button class="hc" data-i="0">1</button>
           <button class="hc" data-i="1">2</button>
           <button class="hc" data-i="2">3</button>
           <button class="hc" data-i="3">4</button>
         </div>
         <div class="row loops">
-          <span class="label">LOOP</span>
+          <span class="label" title="Loop length in beats">Loop</span>
           <button class="lp" data-beats="1">1</button>
           <button class="lp" data-beats="2">2</button>
           <button class="lp" data-beats="4">4</button>
           <button class="lp" data-beats="8">8</button>
           <span class="spacer"></span>
-          <span class="label">GRID</span>
+          <span class="label" title="Fix the detected tempo / beat grid">BPM</span>
           <button class="mini half" title="Halve BPM">÷2</button>
           <button class="mini double" title="Double BPM">×2</button>
-          <button class="mini tap" title="Tap along to set BPM">TAP</button>
-          <button class="mini beat-here" title="Put a beat at the playhead">BEAT</button>
+          <button class="mini tap" title="Tap along to set BPM">Tap</button>
+          <button class="mini beat-here" title="Put a beat at the playhead">Beat</button>
+        </div>
+        <div class="row keyrow">
+          <span class="label">Key</span>
+          <button class="mini key-read" title="Track key → key you hear. Click to reset the key shift.">—</button>
+          <button class="mini key-down" title="Key down a semitone (tempo unchanged)">−</button>
+          <button class="mini key-up" title="Key up a semitone (tempo unchanged)">+</button>
+          <button class="mini key-lock" title="Key lock: the tempo slider changes speed only, not pitch">Lock</button>
+          <button class="mini key-match" title="Shift this deck into the other deck's key (or its relative major/minor)">Match</button>
+        </div>
+        <div class="row stemrow" title="Stems — real-time split of this deck into vocals, drums and instruments">
+          <span class="label">Stems</span>
+          <button class="stem" data-stem="vocals" title="Vocals on/off (Shift-click: solo, right-click: all on)">Vocals</button>
+          <button class="stem" data-stem="drums" title="Drums on/off (Shift-click: solo, right-click: all on)">Drums</button>
+          <button class="stem" data-stem="instruments" title="Instruments on/off (Shift-click: solo, right-click: all on)">Instruments</button>
         </div>
       </div>
     </div>
